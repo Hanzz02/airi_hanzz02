@@ -44,6 +44,7 @@ import {
   METRIC_STRIPE_PAYMENT_FAILED,
   METRIC_STRIPE_SUBSCRIPTION_EVENT,
   METRIC_USER_ACTIVE_SESSIONS,
+  METRIC_USER_DISTINCT_ACTIVE,
   METRIC_USER_LOGIN,
   METRIC_USER_REGISTERED,
   METRIC_WS_CONNECTIONS_ACTIVE,
@@ -77,6 +78,21 @@ export interface AuthMetrics {
    *   "Multi-Replica Considerations".
    */
   activeSessions: ObservableGauge
+  /**
+   * Pull-based gauge for distinct users with ≥1 non-expired session.
+   *
+   * Use when:
+   * - Querying real "active users" — not session rows. Better Auth creates a
+   *   new `session` row per sign-in and per OIDC token refresh, and never
+   *   GCs expired rows, so {@link AuthMetrics.activeSessions} drifts up
+   *   over time even when the actual user base is small.
+   *
+   * Expects:
+   * - Backed by `SELECT COUNT(DISTINCT user_id) FROM session WHERE expires_at > now()`.
+   *   Same cluster-wide truth as `activeSessions`; dashboards MUST aggregate
+   *   with `avg()`, not `sum()` — see observability-conventions.md.
+   */
+  distinctActiveUsers: ObservableGauge
 }
 
 export interface EngagementMetrics {
@@ -116,17 +132,25 @@ export interface RevenueMetrics {
   fluxInsufficientBalance: Counter
   fluxCredited: Counter
   /**
-   * Streaming-only: Flux consumed by a request whose post-stream debit failed.
+   * Flux value that the LLM proxy could not collect from the user. Fires from
+   * both the streaming and non-streaming completion paths.
    *
    * Use when:
-   * - Tracking real revenue leak in the LLM streaming proxy.
+   * - Tracking real revenue leak in the LLM proxy.
+   *
+   * Labels (`reason`):
+   * - `debit_failed` — `consumeFluxForLLM` threw (DB error, or `balance <= 0`
+   *   after a race lost). Counter records the *full* requested amount.
+   * - `partial_debit_drained` — user had `0 < balance < requested`, so we
+   *   drained the balance to zero and charged what we could. Counter records
+   *   `requested - charged` (the unbilled remainder only).
    *
    * Why this needs its own metric:
    * - The streaming response is already sent (HTTP 200, tokens delivered) by
-   *   the time the catch around `billingService.consumeFluxForLLM` runs.
-   *   DB latency / HTTP 5xx alerts do NOT fire on this path — the failure is
-   *   silent at the transport layer. This counter is the only signal that
-   *   ties Flux value owed to a failed debit.
+   *   the time we discover we can't collect in full. DB latency / HTTP 5xx
+   *   alerts do NOT fire on this path — the failure is silent at the
+   *   transport layer. This counter is the only signal that ties Flux value
+   *   owed to a missed debit.
    * - Recommended alert: `increase(airi_billing_flux_unbilled_total[5m]) > 0`
    *   pages on-call immediately on any sustained leak.
    */
@@ -217,7 +241,10 @@ export function initOtel(env: Env): OtelInstance | null {
       description: 'Number of user sign-ins',
     }),
     activeSessions: meter.createObservableGauge(METRIC_USER_ACTIVE_SESSIONS, {
-      description: 'Active user sessions sourced from Postgres (cluster-wide; dashboard must use max(), not sum())',
+      description: 'Active user sessions sourced from Postgres (cluster-wide; dashboard must use avg(), not sum())',
+    }),
+    distinctActiveUsers: meter.createObservableGauge(METRIC_USER_DISTINCT_ACTIVE, {
+      description: 'Distinct users with ≥1 non-expired session — true active-user count, immune to per-row session inflation (cluster-wide; dashboard must use avg(), not sum())',
     }),
   }
 
